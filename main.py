@@ -1,8 +1,8 @@
 """
 Clipzio resolver backend.
 
-A tiny FastAPI service that turns an Instagram/TikTok link into a direct,
-no-watermark video URL using yt-dlp (the most reliable extractor there is).
+A tiny FastAPI service that turns a video link into a direct, no-watermark
+video URL using yt-dlp (the most reliable extractor there is).
 
 The Flutter app calls:  GET  {backendBase}/resolve?url=<link>
 and expects JSON:
@@ -15,20 +15,25 @@ and expects JSON:
       "noWatermark": true
     }
 
-Run locally:
-    pip install -r requirements.txt
-    uvicorn main:app --host 0.0.0.0 --port 8000
-Then set AppConfig.backendBase = "http://<your-ip>:8000" in the app.
+Instagram (and sometimes TikTok) rate-limit datacenter IPs. Two things fight
+that here:
+  * retry with backoff on transient failures, and
+  * optional cookies (set IG_COOKIES_B64 to a base64 cookies.txt from a burner
+    account) which make Instagram requests reliable and fast.
 """
+import base64
+import os
+import tempfile
+import time
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import httpx
 import yt_dlp
 
-app = FastAPI(title="Clipzio Resolver", version="1.0.0")
+app = FastAPI(title="Clipzio Resolver", version="1.1.0")
 
-# The app talks server-to-server, but CORS is handy if you ever call from web.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,24 +41,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-YDL_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "skip_download": True,
-    "noplaylist": True,
-    # Prefer a single progressive mp4 (audio+video together) so the app can
-    # save it straight to the gallery without any merging.
-    "format": "b[ext=mp4][acodec!=none][vcodec!=none]/b[acodec!=none][vcodec!=none]/b",
-}
-
 BROWSER_UA = (
     "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 )
 
+# --- optional cookies (helps Instagram a lot) --------------------------------
+_COOKIEFILE = None
+
+
+def _setup_cookies():
+    global _COOKIEFILE
+    b64 = os.environ.get("IG_COOKIES_B64")
+    if b64:
+        try:
+            data = base64.b64decode(b64)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            tmp.write(data)
+            tmp.close()
+            _COOKIEFILE = tmp.name
+            print("cookies: loaded from IG_COOKIES_B64")
+            return
+        except Exception as e:  # noqa: BLE001
+            print("cookies: failed to load IG_COOKIES_B64:", e)
+    if os.path.exists("cookies.txt"):
+        _COOKIEFILE = "cookies.txt"
+        print("cookies: using cookies.txt")
+
+
+_setup_cookies()
+
+
+def _ydl_opts() -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "format": (
+            "b[ext=mp4][acodec!=none][vcodec!=none]/"
+            "b[acodec!=none][vcodec!=none]/b"
+        ),
+        "http_headers": {"User-Agent": BROWSER_UA},
+        "socket_timeout": 20,
+    }
+    if _COOKIEFILE:
+        opts["cookiefile"] = _COOKIEFILE
+    return opts
+
+
+def _extract(url: str) -> dict:
+    """Extract info with a few retries (Instagram is flaky on datacenter IPs)."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info:
+                return info
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+        time.sleep(1.2 * (attempt + 1))
+    raise HTTPException(
+        status_code=422,
+        detail=f"Could not resolve after retries: {last_err}",
+    )
+
 
 def _pick_progressive(info: dict) -> str | None:
-    """Choose the best mp4 that already has both audio and video."""
     best = None
     for f in info.get("formats") or []:
         has_v = f.get("vcodec") not in (None, "none")
@@ -68,39 +123,37 @@ def _pick_progressive(info: dict) -> str | None:
 
 
 def _author(info: dict) -> str | None:
-    handle = info.get("uploader_id") or info.get("uploader") or info.get("channel")
+    # Prefer the human handle over Instagram's numeric uploader_id.
+    handle = (
+        info.get("uploader")
+        or info.get("channel")
+        or info.get("uploader_id")
+    )
     if not handle:
         return None
     return handle if str(handle).startswith("@") else f"@{handle}"
 
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.get("/resolve")
-def resolve(url: str = Query(..., description="TikTok or Instagram video URL")):
-    try:
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"Could not resolve: {e}")
-
-    if not info:
-        raise HTTPException(status_code=422, detail="Nothing found at that link")
-
-    # A carousel/playlist may nest entries — take the first video.
+def _first_video(info: dict) -> dict:
     if info.get("entries"):
         entries = [e for e in info["entries"] if e]
         if not entries:
             raise HTTPException(status_code=422, detail="No video in that post")
-        info = entries[0]
+        return entries[0]
+    return info
 
+
+@app.get("/health")
+def health():
+    return {"ok": True, "cookies": bool(_COOKIEFILE)}
+
+
+@app.get("/resolve")
+def resolve(url: str = Query(..., description="Video URL")):
+    info = _first_video(_extract(url))
     download_url = _pick_progressive(info)
     if not download_url:
         raise HTTPException(status_code=422, detail="No downloadable stream")
-
     return {
         "downloadUrl": download_url,
         "thumbnail": info.get("thumbnail"),
@@ -111,32 +164,18 @@ def resolve(url: str = Query(..., description="TikTok or Instagram video URL")):
     }
 
 
-# ---------------------------------------------------------------------------
-# Optional streaming proxy.
-#
-# Some CDN URLs (occasionally Instagram) only serve when the exact request
-# headers are replayed. If a resolved downloadUrl ever 403s from the app,
-# point the app at this instead by returning:
-#     downloadUrl = f"{backendBase}/download?url=<original link>"
-# and it will stream the bytes through the backend with the right headers.
-# Costs backend bandwidth, so it's opt-in.
-# ---------------------------------------------------------------------------
 @app.get("/download")
 async def download(url: str = Query(...)):
-    try:
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if info and info.get("entries"):
-            info = [e for e in info["entries"] if e][0]
-        direct = _pick_progressive(info) if info else None
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"Could not resolve: {e}")
+    info = _first_video(_extract(url))
+    direct = _pick_progressive(info)
     if not direct:
         raise HTTPException(status_code=422, detail="No downloadable stream")
 
     async def _stream():
         async with httpx.AsyncClient(timeout=None, follow_redirects=True) as c:
-            async with c.stream("GET", direct, headers={"User-Agent": BROWSER_UA}) as r:
+            async with c.stream(
+                "GET", direct, headers={"User-Agent": BROWSER_UA}
+            ) as r:
                 async for chunk in r.aiter_bytes(64 * 1024):
                     yield chunk
 
