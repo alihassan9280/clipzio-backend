@@ -1,0 +1,16 @@
+name: keep-alive
+
+# Pings the Render backend so the free instance never idles into a cold start.
+# Render sleeps after ~15 min of inactivity; we ping every 10 min.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: |
+          curl -sS -m 60 https://clipzio-backend.onrender.com/health || true
