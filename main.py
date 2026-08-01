@@ -28,7 +28,7 @@ import time
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 import httpx
 import yt_dlp
 
@@ -180,3 +180,64 @@ async def download(url: str = Query(...)):
                     yield chunk
 
     return StreamingResponse(_stream(), media_type="video/mp4")
+
+
+PRIVACY_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clipzio - Privacy Policy</title>
+<style>body{font-family:system-ui,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1a1a1a}h1{font-size:26px}h2{font-size:19px;margin-top:28px}small{color:#666}</style>
+</head><body>
+<h1>Clipzio - Privacy Policy</h1>
+<small>Last updated: 1 August 2026</small>
+
+<p>This Privacy Policy explains how the Clipzio app ("Clipzio", "we", "us")
+handles information. By using Clipzio you agree to this policy.</p>
+
+<h2>Information we collect</h2>
+<p>Clipzio does <strong>not</strong> require an account and does not ask for your
+name, email, or other personal identifiers. We do not sell your data.</p>
+<ul>
+<li><strong>Clipboard:</strong> When you open the app it checks your clipboard for
+a video link so it can offer a one-tap action. This check happens on your device;
+the clipboard content is not stored or transmitted unless you start a download.</li>
+<li><strong>Links you submit:</strong> When you start a download, the video link
+you provide is sent to our processing server only to retrieve the corresponding
+video file. Links are used to fulfil your request and are not used to profile you.</li>
+<li><strong>Saved videos:</strong> Downloaded videos are stored in your device's
+gallery. They stay on your device; we do not receive copies.</li>
+</ul>
+
+<h2>Permissions</h2>
+<p>Clipzio requests storage/media permission solely to save videos to your gallery,
+and internet access to fetch videos.</p>
+
+<h2>Third parties</h2>
+<p>To retrieve videos, requests may be processed through our server and the source
+content-delivery networks. We do not share personal information with advertisers.
+This version of the app does not display ads.</p>
+
+<h2>Data retention</h2>
+<p>We do not maintain user accounts or long-term personal records. Transient
+request data is used only to complete your download.</p>
+
+<h2>Children</h2>
+<p>Clipzio is not directed to children under 13, and we do not knowingly collect
+information from them.</p>
+
+<h2>Your responsibility</h2>
+<p>Clipzio is a tool. You are responsible for only downloading content you own or
+have permission to use, and for complying with the terms of the sites you use and
+applicable copyright law.</p>
+
+<h2>Changes</h2>
+<p>We may update this policy; the "Last updated" date will change accordingly.</p>
+
+<h2>Contact</h2>
+<p>Questions: <a href="mailto:ah457003@gmail.com">ah457003@gmail.com</a></p>
+</body></html>"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    return PRIVACY_HTML
