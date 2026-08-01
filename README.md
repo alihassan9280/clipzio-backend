@@ -60,9 +60,25 @@ docker run -d -p 8000:8000 --restart unless-stopped clipzio-resolver
 - `yt-dlp` is updated often to keep up with Instagram/TikTok changes. Redeploy
   periodically (Docker rebuild re-pulls the latest `yt-dlp`) so extraction keeps
   working. On Render/Railway, a redeploy is enough.
-- Instagram may rate-limit a shared cloud IP. If you hit that, add cookies:
-  export your IG cookies to `cookies.txt`, add `COPY cookies.txt .` to the
-  Dockerfile, and set `YDL_OPTS["cookiefile"] = "cookies.txt"` in `main.py`.
+### Instagram cookies (required for reliable IG on a cloud IP)
+
+Instagram blocks logged-out requests from datacenter IPs (Render, etc.), so IG
+resolves fail with "empty media response". Fix it with cookies from a **burner**
+Instagram account (don't use your main — automated use can get it limited):
+
+1. In Chrome, log into instagram.com with the burner account.
+2. Install the extension **"Get cookies.txt LOCALLY"**.
+3. On instagram.com, export → save `cookies.txt`.
+4. Base64-encode it (keeps it out of logs) and copy to clipboard:
+   ```powershell
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes("$env:USERPROFILE\Downloads\instagram.com_cookies.txt")) | Set-Clipboard
+   ```
+5. Render dashboard → the service → **Environment** → add variable
+   `IG_COOKIES_B64` = (paste) → Save. Render redeploys and IG works.
+
+Cookies expire in a few weeks — repeat when IG starts failing again. `/health`
+returns `"cookies": true` once they're loaded. Never commit cookies to the repo.
+For scale (many users), use a residential proxy instead of one account's cookies.
 
 ## Legal
 
