@@ -241,3 +241,24 @@ applicable copyright law.</p>
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy():
     return PRIVACY_HTML
+
+
+# ---------------------------------------------------------------------------
+# App update config. Bump APP_LATEST_BUILD when you publish a new version so
+# older apps show the "Update now" popup. Set APP_MIN_BUILD to force-update
+# (block) builds older than it.
+# ---------------------------------------------------------------------------
+APP_LATEST_BUILD = 2      # newest versionCode published on Play
+APP_MIN_BUILD = 1         # builds below this are force-updated (blocked)
+APP_UPDATE_URL = "https://play.google.com/store/apps/details?id=com.clipzio.clipzio"
+APP_UPDATE_MESSAGE = "A new version of Clipzio is available with improvements."
+
+
+@app.get("/config")
+def config():
+    return {
+        "latest_build": APP_LATEST_BUILD,
+        "min_build": APP_MIN_BUILD,
+        "url": APP_UPDATE_URL,
+        "message": APP_UPDATE_MESSAGE,
+    }
