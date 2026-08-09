@@ -143,8 +143,11 @@ def _first_video(info: dict) -> dict:
     return info
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
+    # HEAD is included so uptime pingers (UptimeRobot etc.) that send HEAD
+    # get a 200 instead of 405 — keeps the free instance warm without false
+    # "down" alerts.
     return {"ok": True, "cookies": bool(_COOKIEFILE)}
 
 
