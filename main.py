@@ -25,6 +25,7 @@ import base64
 import os
 import tempfile
 import time
+import urllib.parse
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +46,65 @@ BROWSER_UA = (
     "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 )
+
+# --- RapidAPI Instagram resolver (permanent, no cookies) ---------------------
+# Set RAPIDAPI_KEY in the environment. When present, Instagram links resolve via
+# RapidAPI (its own IPs handle Instagram) instead of cookie-based yt-dlp.
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+RAPIDAPI_HOST = os.environ.get(
+    "RAPIDAPI_HOST", "instagram-reels-downloader-api.p.rapidapi.com"
+)
+
+
+def _resolve_via_rapidapi(url: str) -> dict:
+    """Resolve an Instagram link via the RapidAPI reels downloader."""
+    endpoint = (
+        f"https://{RAPIDAPI_HOST}/download?url="
+        + urllib.parse.quote(url, safe="")
+    )
+    headers = {
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "x-rapidapi-key": RAPIDAPI_KEY or "",
+    }
+    with httpx.Client(timeout=30, follow_redirects=True) as c:
+        r = c.get(endpoint, headers=headers)
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=422, detail=f"RapidAPI HTTP {r.status_code}"
+        )
+    j = r.json()
+    if not j.get("success"):
+        raise HTTPException(
+            status_code=422, detail=str(j.get("message") or "resolve failed")
+        )
+    data = j.get("data") or {}
+    medias = data.get("medias") or []
+
+    # Prefer a video (not audio-only) mp4 with the highest resolution.
+    vids = [m for m in medias if not m.get("is_audio") and m.get("url")]
+    if not vids:
+        vids = [m for m in medias if m.get("url")]
+    if not vids:
+        raise HTTPException(status_code=422, detail="No downloadable media")
+
+    def score(m):
+        h = m.get("height") or 0
+        is_mp4 = 1 if (m.get("extension") == "mp4"
+                       or ".mp4" in (m.get("url") or "")) else 0
+        return (is_mp4, h)
+
+    best = max(vids, key=score)
+    author = data.get("author") or data.get("username")
+    if author and not str(author).startswith("@"):
+        author = f"@{author}"
+    return {
+        "downloadUrl": best["url"],
+        "thumbnail": data.get("thumbnail"),
+        "author": author,
+        "title": data.get("title"),
+        "duration": int(data.get("duration") or 0),
+        "noWatermark": True,
+    }
 
 # --- optional cookies (helps Instagram a lot) --------------------------------
 _COOKIEFILE = None
@@ -153,6 +213,14 @@ def health():
 
 @app.get("/resolve")
 def resolve(url: str = Query(..., description="Video URL")):
+    # Instagram: use RapidAPI when a key is set (permanent, no cookies).
+    # Fall back to yt-dlp if RapidAPI fails.
+    if RAPIDAPI_KEY and "instagram.com" in url.lower():
+        try:
+            return _resolve_via_rapidapi(url)
+        except Exception:  # noqa: BLE001
+            pass
+
     info = _first_video(_extract(url))
     download_url = _pick_progressive(info)
     if not download_url:
