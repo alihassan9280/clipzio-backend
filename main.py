@@ -59,7 +59,7 @@ BROWSER_UA = (
 ALLOWED_HOSTS = tuple(
     h.strip().lower()
     for h in os.environ.get(
-        "ALLOWED_HOSTS", "instagram.com,instagr.am,tiktok.com"
+        "ALLOWED_HOSTS", "instagram.com,instagr.am,tiktok.com,tiktokv.com"
     ).split(",")
     if h.strip()
 )

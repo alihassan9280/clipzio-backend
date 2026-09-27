@@ -1,0 +1,46 @@
+name: live-smoke
+
+# Resolves real TikTok/Instagram links with the old (main) and new (this
+# branch) code side by side, downloads what the app would download, and checks
+# with ffprobe that it's a real video with audio. Fails only on a regression.
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: new
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: old
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q -r new/requirements.txt
+          pip install -q -U yt-dlp
+      - name: Start servers
+        run: |
+          (cd old && uvicorn main:app --port 8001 > ../old.log 2>&1 &)
+          (cd new && uvicorn main:app --port 8002 > ../new.log 2>&1 &)
+          for p in 8001 8002; do
+            for i in $(seq 1 30); do curl -sf localhost:$p/health && break; sleep 1; done
+          done
+      - name: Smoke test
+        env:
+          OLD_SRC: old/main.py
+          NEW_SRC: new/main.py
+        run: python new/tests/smoke_live.py old=http://127.0.0.1:8001 new=http://127.0.0.1:8002
+      - name: Server logs
+        if: always()
+        run: |
+          echo "--- old"; cat old.log || true
+          echo "--- new"; cat new.log || true

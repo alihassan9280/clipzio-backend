@@ -34,7 +34,7 @@ Too many requests from one IP returns `429`.
 | `RAPIDAPI_COOLDOWN_S` | `3600` | After RapidAPI returns 401/403/429 (quota used up), skip it for this long |
 | `RESOLVE_CACHE_TTL` | `900` | Seconds a `/resolve` answer is reused for the same link (saves quota); `0` = off |
 | `IG_COOKIES_B64` | — | Backup: base64 Instagram `cookies.txt` for yt-dlp |
-| `ALLOWED_HOSTS` | `instagram.com,instagr.am,tiktok.com` | Sites the server will resolve |
+| `ALLOWED_HOSTS` | `instagram.com,instagr.am,tiktok.com,tiktokv.com` | Sites the server will resolve |
 | `RATE_LIMIT_PER_MIN` | `60` | Requests per minute per IP; `0` = off |
 | `APP_LATEST_BUILD` / `APP_MIN_BUILD` | `2` / `1` | `/config` update popup / force-update |
 | `APP_UPDATE_URL` / `APP_UPDATE_MESSAGE` | Play Store link / default text | `/config` popup |
