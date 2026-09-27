@@ -23,7 +23,14 @@ for **both** platforms (more reliable than the built-in client-side resolvers).
 | `GET /privacy` | Privacy policy page (linked from the Play Store listing) |
 
 Only Instagram and TikTok links are accepted (`400 Unsupported link` otherwise).
-Too many requests from one IP returns `429`.
+There is no download limit by default (see `RATE_LIMIT_PER_MIN`).
+
+### Instagram: unlimited by default
+With `IG_STRATEGY=auto` (the default) and `IG_COOKIES_B64` set, Instagram goes
+through yt-dlp + cookies first (free, no quota). RapidAPI is only used as a
+backup when that fails (e.g. the cookies expired), so its small free quota
+lasts. Without cookies, RapidAPI is tried first. `/health` shows `cookies`,
+`rapidapi_paused` and `ig_strategy`.
 
 ## Environment variables (Render → service → Environment)
 
@@ -33,9 +40,10 @@ Too many requests from one IP returns `429`.
 | `RAPIDAPI_HOST` | `instagram-reels-downloader-api.p.rapidapi.com` | RapidAPI host |
 | `RAPIDAPI_COOLDOWN_S` | `3600` | After RapidAPI returns 401/403/429 (quota used up), skip it for this long |
 | `RESOLVE_CACHE_TTL` | `900` | Seconds a `/resolve` answer is reused for the same link (saves quota); `0` = off |
-| `IG_COOKIES_B64` | — | Backup: base64 Instagram `cookies.txt` for yt-dlp |
+| `IG_COOKIES_B64` | — | Base64 Instagram `cookies.txt` for yt-dlp (free, unlimited IG) |
+| `IG_STRATEGY` | `auto` | `auto` (cookies first if set), `ytdlp_first` or `rapidapi_first` |
 | `ALLOWED_HOSTS` | `instagram.com,instagr.am,tiktok.com,tiktokv.com` | Sites the server will resolve |
-| `RATE_LIMIT_PER_MIN` | `60` | Requests per minute per IP; `0` = off |
+| `RATE_LIMIT_PER_MIN` | `0` (off) | Requests per minute per IP, if you ever need to stop abuse |
 | `APP_LATEST_BUILD` / `APP_MIN_BUILD` | `2` / `1` | `/config` update popup / force-update |
 | `APP_UPDATE_URL` / `APP_UPDATE_MESSAGE` | Play Store link / default text | `/config` popup |
 
@@ -78,8 +86,9 @@ docker run -d -p 8000:8000 --restart unless-stopped clipzio-resolver
 - `yt-dlp` is updated often to keep up with Instagram/TikTok changes. Redeploy
   periodically so extraction keeps working. The Dockerfile always installs the
   newest `yt-dlp` release, so on Render/Railway a redeploy is enough.
-- RapidAPI's free plan is only a few requests per month. When it runs out the
-  server falls back to yt-dlp (which needs `IG_COOKIES_B64` for Instagram).
+- RapidAPI's free plan is only a few requests per month, so it's used as a
+  backup. Keep `IG_COOKIES_B64` fresh: when `/health` stays fine but IG
+  downloads start failing, refresh the cookies (steps below).
 
 ### Instagram cookies (required for reliable IG on a cloud IP)
 

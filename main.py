@@ -17,10 +17,10 @@ and expects JSON:
 
 Instagram (and sometimes TikTok) rate-limit datacenter IPs. Three things fight
 that here:
-  * RapidAPI for Instagram when RAPIDAPI_KEY is set,
-  * retry with backoff on transient failures, and
-  * optional cookies (set IG_COOKIES_B64 to a base64 cookies.txt from a burner
-    account) which make Instagram requests reliable and fast.
+  * cookies (set IG_COOKIES_B64 to a base64 cookies.txt from a burner
+    account) - free and unlimited, tried first for Instagram,
+  * RapidAPI (RAPIDAPI_KEY) as a backup when cookies fail, and
+  * retry with backoff on transient failures.
 """
 import base64
 import os
@@ -91,9 +91,9 @@ def _check_url(url: str) -> tuple[str, str]:
 
 
 # --- simple per-IP rate limit (protects the RapidAPI quota) -----------------
-# RATE_LIMIT_PER_MIN=0 turns it off. Mobile carriers share IPs between many
-# users, so keep this generous.
-RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
+# Off by default (unlimited downloads). Set RATE_LIMIT_PER_MIN (e.g. 60) in
+# the environment if someone starts abusing the server.
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "0"))
 _hits: dict[str, deque] = {}
 _hits_lock = threading.Lock()
 
@@ -141,6 +141,13 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = os.environ.get(
     "RAPIDAPI_HOST", "instagram-reels-downloader-api.p.rapidapi.com"
 )
+# Instagram order (IG_STRATEGY):
+#   auto            cookies (yt-dlp) first when IG cookies are set - free and
+#                   unlimited - and RapidAPI only as a backup; RapidAPI first
+#                   when there are no cookies. (default)
+#   ytdlp_first     always yt-dlp first, RapidAPI as backup
+#   rapidapi_first  always RapidAPI first, yt-dlp as backup
+IG_STRATEGY = os.environ.get("IG_STRATEGY", "auto").strip().lower()
 # When RapidAPI says the quota is used up (429) or the key is rejected
 # (401/403), stop calling it for a while and go straight to yt-dlp.
 RAPIDAPI_COOLDOWN_S = int(os.environ.get("RAPIDAPI_COOLDOWN_S", "3600"))
@@ -312,13 +319,12 @@ def _is_permanent(err: Exception) -> bool:
     return any(m in msg for m in _PERMANENT_ERRORS)
 
 
-def _extract(url: str) -> dict:
+def _extract(url: str, attempts: int = 3) -> dict:
     """Extract the (first) video's info, retrying transient failures.
 
     Instagram is flaky on datacenter IPs, so network/rate-limit errors are
     retried; permanent errors (removed, private, unsupported) fail fast.
     """
-    attempts = 3
     last_err = None
     for attempt in range(attempts):
         cookiefile = _cookie_copy()
@@ -419,7 +425,13 @@ def health():
     # HEAD is included so uptime pingers (UptimeRobot etc.) that send HEAD
     # get a 200 instead of 405 — keeps the free instance warm without false
     # "down" alerts.
-    return {"ok": True, "cookies": bool(_COOKIEFILE)}
+    return {
+        "ok": True,
+        "cookies": bool(_COOKIEFILE),
+        "rapidapi": bool(RAPIDAPI_KEY),
+        "rapidapi_paused": time.monotonic() < _rapidapi_off_until,
+        "ig_strategy": IG_STRATEGY,
+    }
 
 
 @app.get("/resolve")
@@ -431,13 +443,16 @@ def resolve(request: Request, url: str = Query(..., description="Video URL")):
     if cached:
         return cached
 
-    # Instagram: use RapidAPI when a key is set (permanent, no cookies).
-    # Fall back to yt-dlp if RapidAPI fails or is paused (quota used up).
-    if (
-        RAPIDAPI_KEY
-        and _host_matches(host, INSTAGRAM_HOSTS)
-        and time.monotonic() >= _rapidapi_off_until
-    ):
+    is_ig = _host_matches(host, INSTAGRAM_HOSTS)
+    rapid_ok = bool(
+        RAPIDAPI_KEY and is_ig and time.monotonic() >= _rapidapi_off_until
+    )
+    ytdlp_first = IG_STRATEGY == "ytdlp_first" or (
+        IG_STRATEGY == "auto" and bool(_COOKIEFILE)
+    )
+
+    if rapid_ok and not ytdlp_first:
+        # RapidAPI first, yt-dlp as backup.
         try:
             result = _resolve_via_rapidapi(url)
             _cache_put(url, result)
@@ -445,8 +460,29 @@ def resolve(request: Request, url: str = Query(..., description="Video URL")):
         except Exception as e:  # noqa: BLE001
             detail = e.detail if isinstance(e, HTTPException) else e
             print(f"rapidapi failed, falling back to yt-dlp: {detail}")
+    elif rapid_ok:
+        # yt-dlp (free, unlimited) first; RapidAPI only if it fails, e.g.
+        # expired cookies. One attempt so the backup kicks in quickly.
+        try:
+            result = _resolve_via_ytdlp(url, attempts=1)
+        except HTTPException as first:
+            print("yt-dlp failed for instagram, trying rapidapi")
+            try:
+                result = _resolve_via_rapidapi(url)
+            except Exception as e:  # noqa: BLE001
+                detail = e.detail if isinstance(e, HTTPException) else e
+                print(f"rapidapi backup failed too: {detail}")
+                raise first
+        _cache_put(url, result)
+        return result
 
-    info = _extract(url)
+    result = _resolve_via_ytdlp(url)
+    _cache_put(url, result)
+    return result
+
+
+def _resolve_via_ytdlp(url: str, attempts: int = 3) -> dict:
+    info = _extract(url, attempts)
     fmt = _pick_progressive(info)
     if not fmt:
         raise HTTPException(status_code=422, detail="No downloadable stream")
@@ -458,7 +494,6 @@ def resolve(request: Request, url: str = Query(..., description="Video URL")):
         "duration": int(info.get("duration") or 0),
         "noWatermark": not _is_watermarked(fmt),
     }
-    _cache_put(url, result)
     return result
 
 
