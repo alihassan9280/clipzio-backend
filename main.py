@@ -21,6 +21,9 @@ that here:
     account) - free and unlimited, tried first for Instagram,
   * RapidAPI (RAPIDAPI_KEY) as a backup when cookies fail, and
   * retry with backoff on transient failures.
+
+TikTok blocks yt-dlp from datacenter IPs, so TikTok links resolve via tikwm
+(free, no key) first, with yt-dlp as the backup.
 """
 import base64
 import os
@@ -64,6 +67,7 @@ ALLOWED_HOSTS = tuple(
     if h.strip()
 )
 INSTAGRAM_HOSTS = ("instagram.com", "instagr.am")
+TIKTOK_HOSTS = ("tiktok.com", "tiktokv.com")
 
 
 def _host_matches(host: str, domains) -> bool:
@@ -208,6 +212,47 @@ def _resolve_via_rapidapi(url: str) -> dict:
         "duration": int(data.get("duration") or 0),
         "noWatermark": True,
     }
+
+# --- tikwm TikTok resolver (free, no key) ------------------------------------
+# TikTok blocks yt-dlp from datacenter IPs (Render included), so TikTok links
+# go to tikwm first and yt-dlp is only the backup. TIKWM=0 turns it off.
+TIKWM_ENABLED = os.environ.get("TIKWM", "1") != "0"
+TIKWM_BASE = os.environ.get("TIKWM_BASE", "https://www.tikwm.com").rstrip("/")
+
+
+def _resolve_via_tikwm(url: str) -> dict:
+    """Resolve a TikTok link via tikwm's public API (no-watermark video)."""
+    with httpx.Client(
+        timeout=30, follow_redirects=True, headers={"User-Agent": BROWSER_UA}
+    ) as c:
+        r = c.post(f"{TIKWM_BASE}/api/", data={"url": url, "hd": "1"})
+    if r.status_code != 200:
+        raise HTTPException(status_code=422, detail=f"tikwm HTTP {r.status_code}")
+    j = r.json()
+    if j.get("code") != 0:
+        raise HTTPException(
+            status_code=422, detail=f"tikwm: {j.get('msg') or 'failed'}"
+        )
+    d = j.get("data") or {}
+
+    def absolute(u):
+        return f"{TIKWM_BASE}{u}" if isinstance(u, str) and u.startswith("/") else u
+
+    # "play" is the standard no-watermark mp4 (h264, plays everywhere);
+    # "hdplay" is the HD one. "wmplay" (watermarked) is never used.
+    play = absolute(d.get("play") or d.get("hdplay"))
+    if not play:
+        raise HTTPException(status_code=422, detail="tikwm: no video in post")
+    handle = (d.get("author") or {}).get("unique_id")
+    return {
+        "downloadUrl": play,
+        "thumbnail": absolute(d.get("cover") or d.get("origin_cover")),
+        "author": f"@{handle}" if handle else None,
+        "title": d.get("title"),
+        "duration": int(d.get("duration") or 0),
+        "noWatermark": True,
+    }
+
 
 # --- short cache of /resolve answers -----------------------------------------
 # The same link resolved again within a few minutes (retries, the app asking
@@ -431,6 +476,7 @@ def health():
         "rapidapi": bool(RAPIDAPI_KEY),
         "rapidapi_paused": time.monotonic() < _rapidapi_off_until,
         "ig_strategy": IG_STRATEGY,
+        "tikwm": TIKWM_ENABLED,
     }
 
 
@@ -442,6 +488,15 @@ def resolve(request: Request, url: str = Query(..., description="Video URL")):
     cached = _cache_get(url)
     if cached:
         return cached
+
+    if TIKWM_ENABLED and _host_matches(host, TIKTOK_HOSTS):
+        try:
+            result = _resolve_via_tikwm(url)
+            _cache_put(url, result)
+            return result
+        except Exception as e:  # noqa: BLE001
+            detail = e.detail if isinstance(e, HTTPException) else e
+            print(f"tikwm failed, falling back to yt-dlp: {detail}")
 
     is_ig = _host_matches(host, INSTAGRAM_HOSTS)
     rapid_ok = bool(
@@ -499,30 +554,43 @@ def _resolve_via_ytdlp(url: str, attempts: int = 3) -> dict:
 
 @app.get("/download")
 async def download(request: Request, url: str = Query(...)):
-    url, _ = _check_url(url)
+    url, host = _check_url(url)
     _rate_limit(request)
-    # yt-dlp is blocking; run it off the event loop so other requests
-    # (including /health) keep being served.
-    info = await run_in_threadpool(_extract, url)
-    fmt = _pick_progressive(info)
-    if not fmt:
-        raise HTTPException(status_code=422, detail="No downloadable stream")
 
-    # Send the headers + cookies yt-dlp used, or the CDN often answers 403.
-    headers = {"User-Agent": BROWSER_UA, **(fmt.get("http_headers") or {})}
-    headers.pop("Cookie", None)
-    jar = info.get("_cookiejar")
-    if jar is not None:
-        cookie = jar.get_cookie_header(fmt["url"])
-        if cookie:
-            headers["Cookie"] = cookie
+    target = None
+    headers = {"User-Agent": BROWSER_UA}
+    if TIKWM_ENABLED and _host_matches(host, TIKTOK_HOSTS):
+        try:
+            target = (await run_in_threadpool(_resolve_via_tikwm, url))[
+                "downloadUrl"
+            ]
+        except Exception as e:  # noqa: BLE001
+            detail = e.detail if isinstance(e, HTTPException) else e
+            print(f"download: tikwm failed, falling back to yt-dlp: {detail}")
+
+    if target is None:
+        # yt-dlp is blocking; run it off the event loop so other requests
+        # (including /health) keep being served.
+        info = await run_in_threadpool(_extract, url)
+        fmt = _pick_progressive(info)
+        if not fmt:
+            raise HTTPException(status_code=422, detail="No downloadable stream")
+        target = fmt["url"]
+        # Send the headers + cookies yt-dlp used, or the CDN often answers 403.
+        headers.update(fmt.get("http_headers") or {})
+        headers.pop("Cookie", None)
+        jar = info.get("_cookiejar")
+        if jar is not None:
+            cookie = jar.get_cookie_header(target)
+            if cookie:
+                headers["Cookie"] = cookie
 
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, read=60.0), follow_redirects=True
     )
     try:
         upstream = await client.send(
-            client.build_request("GET", fmt["url"], headers=headers),
+            client.build_request("GET", target, headers=headers),
             stream=True,
         )
     except httpx.HTTPError as e:

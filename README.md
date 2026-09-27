@@ -42,6 +42,7 @@ lasts. Without cookies, RapidAPI is tried first. `/health` shows `cookies`,
 | `RESOLVE_CACHE_TTL` | `900` | Seconds a `/resolve` answer is reused for the same link (saves quota); `0` = off |
 | `IG_COOKIES_B64` | — | Base64 Instagram `cookies.txt` for yt-dlp (free, unlimited IG) |
 | `IG_STRATEGY` | `auto` | `auto` (cookies first if set), `ytdlp_first` or `rapidapi_first` |
+| `TIKWM` | `1` | TikTok via tikwm first (TikTok blocks yt-dlp on server IPs); `0` = yt-dlp only |
 | `ALLOWED_HOSTS` | `instagram.com,instagr.am,tiktok.com,tiktokv.com` | Sites the server will resolve |
 | `RATE_LIMIT_PER_MIN` | `0` (off) | Requests per minute per IP, if you ever need to stop abuse |
 | `APP_LATEST_BUILD` / `APP_MIN_BUILD` | `2` / `1` | `/config` update popup / force-update |
