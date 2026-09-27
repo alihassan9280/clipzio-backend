@@ -18,13 +18,31 @@ for **both** platforms (more reliable than the built-in client-side resolvers).
 |---|---|
 | `GET /resolve?url=<link>` | Returns `{ downloadUrl, thumbnail, author, title, duration, noWatermark }` |
 | `GET /download?url=<link>` | Optional streaming proxy (use only if a direct URL 403s) |
-| `GET /health` | Health check |
+| `GET /health` | Health check (GET or HEAD) |
+| `GET /config` | App update popup: `{ latest_build, min_build, url, message }` |
+| `GET /privacy` | Privacy policy page (linked from the Play Store listing) |
+
+Only Instagram and TikTok links are accepted (`400 Unsupported link` otherwise).
+Too many requests from one IP returns `429`.
+
+## Environment variables (Render → service → Environment)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RAPIDAPI_KEY` | — | Instagram via RapidAPI (no cookies needed) |
+| `RAPIDAPI_HOST` | `instagram-reels-downloader-api.p.rapidapi.com` | RapidAPI host |
+| `RAPIDAPI_COOLDOWN_S` | `3600` | After RapidAPI returns 401/403/429 (quota used up), skip it for this long |
+| `RESOLVE_CACHE_TTL` | `900` | Seconds a `/resolve` answer is reused for the same link (saves quota); `0` = off |
+| `IG_COOKIES_B64` | — | Backup: base64 Instagram `cookies.txt` for yt-dlp |
+| `ALLOWED_HOSTS` | `instagram.com,instagr.am,tiktok.com` | Sites the server will resolve |
+| `RATE_LIMIT_PER_MIN` | `60` | Requests per minute per IP; `0` = off |
+| `APP_LATEST_BUILD` / `APP_MIN_BUILD` | `2` / `1` | `/config` update popup / force-update |
+| `APP_UPDATE_URL` / `APP_UPDATE_MESSAGE` | Play Store link / default text | `/config` popup |
 
 ## Run locally
 
 ```bash
-cd backend
-python -m venv .venv && . .venv/Scripts/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
@@ -58,8 +76,11 @@ docker run -d -p 8000:8000 --restart unless-stopped clipzio-resolver
 ## Keeping it working
 
 - `yt-dlp` is updated often to keep up with Instagram/TikTok changes. Redeploy
-  periodically (Docker rebuild re-pulls the latest `yt-dlp`) so extraction keeps
-  working. On Render/Railway, a redeploy is enough.
+  periodically so extraction keeps working. The Dockerfile always installs the
+  newest `yt-dlp` release, so on Render/Railway a redeploy is enough.
+- RapidAPI's free plan is only a few requests per month. When it runs out the
+  server falls back to yt-dlp (which needs `IG_COOKIES_B64` for Instagram).
+
 ### Instagram cookies (required for reliable IG on a cloud IP)
 
 Instagram blocks logged-out requests from datacenter IPs (Render, etc.), so IG

@@ -15,25 +15,30 @@ and expects JSON:
       "noWatermark": true
     }
 
-Instagram (and sometimes TikTok) rate-limit datacenter IPs. Two things fight
+Instagram (and sometimes TikTok) rate-limit datacenter IPs. Three things fight
 that here:
+  * RapidAPI for Instagram when RAPIDAPI_KEY is set,
   * retry with backoff on transient failures, and
   * optional cookies (set IG_COOKIES_B64 to a base64 cookies.txt from a burner
     account) which make Instagram requests reliable and fast.
 """
 import base64
 import os
+import shutil
 import tempfile
+import threading
 import time
 import urllib.parse
+from collections import deque
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 import httpx
 import yt_dlp
 
-app = FastAPI(title="Clipzio Resolver", version="1.1.0")
+app = FastAPI(title="Clipzio Resolver", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,6 +52,88 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 )
 
+# --- which links we accept ---------------------------------------------------
+# Only these sites (and their subdomains) are resolved. Anything else is
+# rejected so the server can't be used to fetch arbitrary/internal URLs.
+# Add more with ALLOWED_HOSTS="instagram.com,tiktok.com,example.com".
+ALLOWED_HOSTS = tuple(
+    h.strip().lower()
+    for h in os.environ.get(
+        "ALLOWED_HOSTS", "instagram.com,instagr.am,tiktok.com"
+    ).split(",")
+    if h.strip()
+)
+INSTAGRAM_HOSTS = ("instagram.com", "instagr.am")
+
+
+def _host_matches(host: str, domains) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _check_url(url: str) -> tuple[str, str]:
+    """Return (normalized link, hostname), or 400 if it isn't a supported site."""
+    url = url.strip()
+    if "://" not in url:  # "instagram.com/reel/..." -> "https://instagram.com/reel/..."
+        url = "https://" + url
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        host = ""
+        parsed = None
+    if (
+        parsed is None
+        or parsed.scheme not in ("http", "https")
+        or not _host_matches(host, ALLOWED_HOSTS)
+    ):
+        raise HTTPException(status_code=400, detail="Unsupported link")
+    return url, host
+
+
+# --- simple per-IP rate limit (protects the RapidAPI quota) -----------------
+# RATE_LIMIT_PER_MIN=0 turns it off. Mobile carriers share IPs between many
+# users, so keep this generous.
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
+_hits: dict[str, deque] = {}
+_hits_lock = threading.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    # Render sits behind Cloudflare; prefer the header Cloudflare sets, then
+    # the first X-Forwarded-For hop, then the socket peer.
+    ip = request.headers.get("cf-connecting-ip") or request.headers.get(
+        "true-client-ip"
+    )
+    if not ip:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            ip = xff.split(",")[0]
+    if not ip and request.client:
+        ip = request.client.host
+    return (ip or "unknown").strip()
+
+
+def _rate_limit(request: Request) -> None:
+    if RATE_LIMIT_PER_MIN <= 0:
+        return
+    ip = _client_ip(request)
+    now = time.monotonic()
+    with _hits_lock:
+        q = _hits.get(ip)
+        if q is None:
+            if len(_hits) > 10000:  # drop idle IPs so memory stays bounded
+                for k in [k for k, v in _hits.items() if not v or now - v[-1] > 60]:
+                    del _hits[k]
+            q = _hits[ip] = deque()
+        while q and now - q[0] > 60:
+            q.popleft()
+        if len(q) >= RATE_LIMIT_PER_MIN:
+            raise HTTPException(
+                status_code=429, detail="Too many requests, try again shortly"
+            )
+        q.append(now)
+
+
 # --- RapidAPI Instagram resolver (permanent, no cookies) ---------------------
 # Set RAPIDAPI_KEY in the environment. When present, Instagram links resolve via
 # RapidAPI (its own IPs handle Instagram) instead of cookie-based yt-dlp.
@@ -54,10 +141,15 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = os.environ.get(
     "RAPIDAPI_HOST", "instagram-reels-downloader-api.p.rapidapi.com"
 )
+# When RapidAPI says the quota is used up (429) or the key is rejected
+# (401/403), stop calling it for a while and go straight to yt-dlp.
+RAPIDAPI_COOLDOWN_S = int(os.environ.get("RAPIDAPI_COOLDOWN_S", "3600"))
+_rapidapi_off_until = 0.0
 
 
 def _resolve_via_rapidapi(url: str) -> dict:
     """Resolve an Instagram link via the RapidAPI reels downloader."""
+    global _rapidapi_off_until
     endpoint = (
         f"https://{RAPIDAPI_HOST}/download?url="
         + urllib.parse.quote(url, safe="")
@@ -68,6 +160,10 @@ def _resolve_via_rapidapi(url: str) -> dict:
     }
     with httpx.Client(timeout=30, follow_redirects=True) as c:
         r = c.get(endpoint, headers=headers)
+    if r.status_code in (401, 403, 429):
+        _rapidapi_off_until = time.monotonic() + RAPIDAPI_COOLDOWN_S
+        print(f"rapidapi: HTTP {r.status_code}, pausing for "
+              f"{RAPIDAPI_COOLDOWN_S}s")
     if r.status_code != 200:
         raise HTTPException(
             status_code=422, detail=f"RapidAPI HTTP {r.status_code}"
@@ -106,6 +202,39 @@ def _resolve_via_rapidapi(url: str) -> dict:
         "noWatermark": True,
     }
 
+# --- short cache of /resolve answers -----------------------------------------
+# The same link resolved again within a few minutes (retries, the app asking
+# twice) is answered from memory, so it doesn't spend RapidAPI quota twice.
+# CDN links expire after a while, so keep this short. 0 disables it.
+RESOLVE_CACHE_TTL = int(os.environ.get("RESOLVE_CACHE_TTL", "900"))
+_resolve_cache: dict[str, tuple[float, dict]] = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_get(url: str) -> dict | None:
+    if RESOLVE_CACHE_TTL <= 0:
+        return None
+    with _cache_lock:
+        hit = _resolve_cache.get(url)
+        if hit and time.monotonic() - hit[0] < RESOLVE_CACHE_TTL:
+            return hit[1]
+        _resolve_cache.pop(url, None)
+    return None
+
+
+def _cache_put(url: str, result: dict) -> None:
+    if RESOLVE_CACHE_TTL <= 0:
+        return
+    now = time.monotonic()
+    with _cache_lock:
+        if len(_resolve_cache) > 2000:
+            for k in [k for k, v in _resolve_cache.items()
+                      if now - v[0] >= RESOLVE_CACHE_TTL]:
+                del _resolve_cache[k]
+            if len(_resolve_cache) > 2000:
+                _resolve_cache.clear()
+        _resolve_cache[url] = (now, result)
+
 # --- optional cookies (helps Instagram a lot) --------------------------------
 _COOKIEFILE = None
 
@@ -132,7 +261,22 @@ def _setup_cookies():
 _setup_cookies()
 
 
-def _ydl_opts() -> dict:
+def _cookie_copy() -> str | None:
+    """Per-request copy of the cookie file.
+
+    yt-dlp writes the cookie jar back to its cookiefile when it closes, so
+    concurrent requests sharing one file can truncate it. Each request gets
+    its own copy and the original is never written to.
+    """
+    if not _COOKIEFILE:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    shutil.copyfile(_COOKIEFILE, path)
+    return path
+
+
+def _ydl_opts(cookiefile: str | None = None) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -145,41 +289,108 @@ def _ydl_opts() -> dict:
         "http_headers": {"User-Agent": BROWSER_UA},
         "socket_timeout": 20,
     }
-    if _COOKIEFILE:
-        opts["cookiefile"] = _COOKIEFILE
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
     return opts
 
 
+# Errors that won't go away by retrying (bad/removed/private links).
+_PERMANENT_ERRORS = (
+    "unsupported url",
+    "is not a valid url",
+    "http error 404",
+    "video unavailable",
+    "this video is private",
+    "has been removed",
+    "no longer available",
+    "does not exist",
+)
+
+
+def _is_permanent(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(m in msg for m in _PERMANENT_ERRORS)
+
+
 def _extract(url: str) -> dict:
-    """Extract info with a few retries (Instagram is flaky on datacenter IPs)."""
+    """Extract the (first) video's info, retrying transient failures.
+
+    Instagram is flaky on datacenter IPs, so network/rate-limit errors are
+    retried; permanent errors (removed, private, unsupported) fail fast.
+    """
+    attempts = 3
     last_err = None
-    for attempt in range(3):
+    for attempt in range(attempts):
+        cookiefile = _cookie_copy()
         try:
-            with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+            with yt_dlp.YoutubeDL(_ydl_opts(cookiefile)) as ydl:
                 info = ydl.extract_info(url, download=False)
-            if info:
-                return info
+                if info:
+                    video = _first_video(info)
+                    # Keep the jar so /download can send the same cookies the
+                    # CDN expects (TikTok ties video URLs to them).
+                    video["_cookiejar"] = ydl.cookiejar
+                    return video
+        except HTTPException:
+            raise
         except Exception as e:  # noqa: BLE001
             last_err = e
-        time.sleep(1.2 * (attempt + 1))
+            if _is_permanent(e):
+                break
+        finally:
+            if cookiefile:
+                try:
+                    os.unlink(cookiefile)
+                except OSError:
+                    pass
+        if attempt < attempts - 1:
+            time.sleep(1.2 * (attempt + 1))
+    print(f"extract failed for {url}: {last_err}")
     raise HTTPException(
         status_code=422,
-        detail=f"Could not resolve after retries: {last_err}",
+        detail="Could not get this video. It may be private, removed, "
+        "or temporarily unavailable.",
     )
 
 
-def _pick_progressive(info: dict) -> str | None:
-    best = None
-    for f in info.get("formats") or []:
-        has_v = f.get("vcodec") not in (None, "none")
-        has_a = f.get("acodec") not in (None, "none")
-        if has_v and has_a and f.get("url"):
-            h = f.get("height") or 0
-            if best is None or h > (best.get("height") or 0):
-                best = f
-    if best:
-        return best["url"]
-    return info.get("url")
+def _is_watermarked(f: dict) -> bool:
+    # yt-dlp marks TikTok's watermarked "download" formats with preference -2
+    # and a "watermarked" note.
+    note = (f.get("format_note") or "").lower()
+    return (f.get("preference") or 0) <= -2 or "watermark" in note
+
+
+def _is_direct(f: dict) -> bool:
+    # A plain file URL the app can download (not an HLS/DASH manifest).
+    return f.get("protocol") in (None, "http", "https")
+
+
+def _pick_progressive(info: dict) -> dict | None:
+    """Pick the format to hand to the app: one file with video + audio."""
+    # 1) The format yt-dlp itself selected (our `format` option). yt-dlp copies
+    #    it into `info`, and its ranking already puts watermarked TikTok
+    #    formats last.
+    if info.get("url") and _is_direct(info) and not _is_watermarked(info):
+        return info
+
+    # 2) Otherwise choose ourselves: no watermark, direct file, mp4, tallest.
+    cands = [
+        f for f in info.get("formats") or []
+        if f.get("url")
+        and _is_direct(f)
+        and f.get("vcodec") != "none"
+        and f.get("acodec") != "none"
+    ]
+    if cands:
+        return max(cands, key=lambda f: (
+            not _is_watermarked(f),
+            f.get("ext") == "mp4",
+            f.get("height") or 0,
+            f.get("preference") or 0,
+        ))
+
+    # 3) Last resort: whatever yt-dlp selected.
+    return info if info.get("url") else None
 
 
 def _author(info: dict) -> str | None:
@@ -212,45 +423,102 @@ def health():
 
 
 @app.get("/resolve")
-def resolve(url: str = Query(..., description="Video URL")):
-    # Instagram: use RapidAPI when a key is set (permanent, no cookies).
-    # Fall back to yt-dlp if RapidAPI fails.
-    if RAPIDAPI_KEY and "instagram.com" in url.lower():
-        try:
-            return _resolve_via_rapidapi(url)
-        except Exception:  # noqa: BLE001
-            pass
+def resolve(request: Request, url: str = Query(..., description="Video URL")):
+    url, host = _check_url(url)
+    _rate_limit(request)
 
-    info = _first_video(_extract(url))
-    download_url = _pick_progressive(info)
-    if not download_url:
+    cached = _cache_get(url)
+    if cached:
+        return cached
+
+    # Instagram: use RapidAPI when a key is set (permanent, no cookies).
+    # Fall back to yt-dlp if RapidAPI fails or is paused (quota used up).
+    if (
+        RAPIDAPI_KEY
+        and _host_matches(host, INSTAGRAM_HOSTS)
+        and time.monotonic() >= _rapidapi_off_until
+    ):
+        try:
+            result = _resolve_via_rapidapi(url)
+            _cache_put(url, result)
+            return result
+        except Exception as e:  # noqa: BLE001
+            detail = e.detail if isinstance(e, HTTPException) else e
+            print(f"rapidapi failed, falling back to yt-dlp: {detail}")
+
+    info = _extract(url)
+    fmt = _pick_progressive(info)
+    if not fmt:
         raise HTTPException(status_code=422, detail="No downloadable stream")
-    return {
-        "downloadUrl": download_url,
+    result = {
+        "downloadUrl": fmt["url"],
         "thumbnail": info.get("thumbnail"),
         "author": _author(info),
         "title": info.get("title") or info.get("description"),
         "duration": int(info.get("duration") or 0),
-        "noWatermark": True,
+        "noWatermark": not _is_watermarked(fmt),
     }
+    _cache_put(url, result)
+    return result
 
 
 @app.get("/download")
-async def download(url: str = Query(...)):
-    info = _first_video(_extract(url))
-    direct = _pick_progressive(info)
-    if not direct:
+async def download(request: Request, url: str = Query(...)):
+    url, _ = _check_url(url)
+    _rate_limit(request)
+    # yt-dlp is blocking; run it off the event loop so other requests
+    # (including /health) keep being served.
+    info = await run_in_threadpool(_extract, url)
+    fmt = _pick_progressive(info)
+    if not fmt:
         raise HTTPException(status_code=422, detail="No downloadable stream")
 
-    async def _stream():
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as c:
-            async with c.stream(
-                "GET", direct, headers={"User-Agent": BROWSER_UA}
-            ) as r:
-                async for chunk in r.aiter_bytes(64 * 1024):
-                    yield chunk
+    # Send the headers + cookies yt-dlp used, or the CDN often answers 403.
+    headers = {"User-Agent": BROWSER_UA, **(fmt.get("http_headers") or {})}
+    headers.pop("Cookie", None)
+    jar = info.get("_cookiejar")
+    if jar is not None:
+        cookie = jar.get_cookie_header(fmt["url"])
+        if cookie:
+            headers["Cookie"] = cookie
 
-    return StreamingResponse(_stream(), media_type="video/mp4")
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, read=60.0), follow_redirects=True
+    )
+    try:
+        upstream = await client.send(
+            client.build_request("GET", fmt["url"], headers=headers),
+            stream=True,
+        )
+    except httpx.HTTPError as e:
+        await client.aclose()
+        print(f"download: upstream request failed: {e}")
+        raise HTTPException(
+            status_code=502, detail="Could not reach the video server"
+        )
+    if upstream.status_code >= 400:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Video server returned HTTP {upstream.status_code}",
+        )
+
+    async def _stream():
+        try:
+            async for chunk in upstream.aiter_bytes(64 * 1024):
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    out_headers = {}
+    length = upstream.headers.get("content-length")
+    if length and not upstream.headers.get("content-encoding"):
+        out_headers["Content-Length"] = length
+    return StreamingResponse(
+        _stream(), media_type="video/mp4", headers=out_headers
+    )
 
 
 PRIVACY_HTML = """<!doctype html>
@@ -260,7 +528,7 @@ PRIVACY_HTML = """<!doctype html>
 <style>body{font-family:system-ui,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1a1a1a}h1{font-size:26px}h2{font-size:19px;margin-top:28px}small{color:#666}</style>
 </head><body>
 <h1>Clipzio - Privacy Policy</h1>
-<small>Last updated: 1 August 2026</small>
+<small>Last updated: 27 September 2026</small>
 
 <p>This Privacy Policy explains how the Clipzio app ("Clipzio", "we", "us")
 handles information. By using Clipzio you agree to this policy.</p>
@@ -284,13 +552,17 @@ gallery. They stay on your device; we do not receive copies.</li>
 and internet access to fetch videos.</p>
 
 <h2>Third parties</h2>
-<p>To retrieve videos, requests may be processed through our server and the source
-content-delivery networks. We do not share personal information with advertisers.
+<p>To retrieve videos, requests may be processed through our server, the source
+content-delivery networks, and third-party video-lookup services (for example, an
+API provider we use for Instagram links), which receive only the video link.
+We do not share personal information with advertisers.
 This version of the app does not display ads.</p>
 
 <h2>Data retention</h2>
 <p>We do not maintain user accounts or long-term personal records. Transient
-request data is used only to complete your download.</p>
+request data is used only to complete your download. Our hosting provider keeps
+short-lived technical server logs (such as IP address and the requested link) for
+security and troubleshooting.</p>
 
 <h2>Children</h2>
 <p>Clipzio is not directed to children under 13, and we do not knowingly collect
@@ -319,10 +591,18 @@ def privacy():
 # older apps show the "Update now" popup. Set APP_MIN_BUILD to force-update
 # (block) builds older than it.
 # ---------------------------------------------------------------------------
-APP_LATEST_BUILD = 2      # newest versionCode published on Play
-APP_MIN_BUILD = 1         # builds below this are force-updated (blocked)
-APP_UPDATE_URL = "https://play.google.com/store/apps/details?id=com.clipzio.clipzio"
-APP_UPDATE_MESSAGE = "A new version of Clipzio is available with improvements."
+# Each can also be overridden from Render's Environment tab (no code change):
+# APP_LATEST_BUILD, APP_MIN_BUILD, APP_UPDATE_URL, APP_UPDATE_MESSAGE.
+APP_LATEST_BUILD = int(os.environ.get("APP_LATEST_BUILD", "2"))  # newest versionCode on Play
+APP_MIN_BUILD = int(os.environ.get("APP_MIN_BUILD", "1"))  # older builds are force-updated
+APP_UPDATE_URL = os.environ.get(
+    "APP_UPDATE_URL",
+    "https://play.google.com/store/apps/details?id=com.clipzio.clipzio",
+)
+APP_UPDATE_MESSAGE = os.environ.get(
+    "APP_UPDATE_MESSAGE",
+    "A new version of Clipzio is available with improvements.",
+)
 
 
 @app.get("/config")
