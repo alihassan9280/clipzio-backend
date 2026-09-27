@@ -8,6 +8,9 @@ and checks that the file the app would download is a real, playable video.
 Environment:
     OLD_SRC / NEW_SRC   paths to main.py of each version; used to report which
                         yt-dlp format each version picks (watermark check).
+    TIKTOK_LINKS        extra comma-separated TikTok links to test.
+    SITES               "tiktok", "instagram" or both (default). Use "tiktok"
+                        against production so the RapidAPI quota isn't spent.
 
 Exits non-zero only on a regression: a link that works on "old" but not on
 "new", or "new" picking a watermarked TikTok format when a clean one exists.
@@ -117,8 +120,17 @@ def main() -> int:
         if src:
             mods[name] = load(name, src)
 
+    tiktok = [u.strip() for u in os.environ.get("TIKTOK_LINKS", "").split(",")
+              if u.strip()] + TIKTOK
+    sites = os.environ.get("SITES", "tiktok,instagram").lower()
+    plan = []
+    if "tiktok" in sites:
+        plan.append(("TikTok", tiktok))
+    if "instagram" in sites:
+        plan.append(("Instagram", INSTAGRAM))
+
     client = httpx.Client(timeout=120, follow_redirects=True)
-    for site, links in (("TikTok", TIKTOK), ("Instagram", INSTAGRAM)):
+    for site, links in plan:
         for link in links:
             ok_by_server = {}
             for name, base in servers.items():
