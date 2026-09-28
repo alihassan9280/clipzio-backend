@@ -1,0 +1,72 @@
+name: live-smoke
+
+# Resolves real TikTok/Instagram links with the old (main) and new (this
+# branch) code side by side, downloads what the app would download, and checks
+# with ffprobe that it's a real video with audio. Fails only on a regression.
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      production:
+        description: "Also test TikTok links against the live Render server"
+        type: boolean
+        default: false
+      ig_probe:
+        description: "Only probe which free Instagram methods work (skips the rest)"
+        type: boolean
+        default: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: new
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: old
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q -r new/requirements.txt
+          pip install -q -U yt-dlp
+      - name: Probe free Instagram methods
+        if: ${{ inputs.ig_probe }}
+        run: python new/tests/ig_probe.py Chunk8-jurw CDUMkliABpa Cop84x6u7CP CWqAgUZgCku
+      - name: Find fresh TikTok videos
+        if: ${{ !inputs.ig_probe }}
+        run: |
+          links=$(yt-dlp --flat-playlist -I 1:3 --print webpage_url \
+            https://www.tiktok.com/@tiktok 2>&1 | grep '^https://' | paste -sd, - || true)
+          echo "discovered: ${links:-none}"
+          echo "TIKTOK_LINKS=$links" >> "$GITHUB_ENV"
+      - name: Start servers
+        if: ${{ !inputs.ig_probe }}
+        run: |
+          (cd old && uvicorn main:app --port 8001 > ../old.log 2>&1 &)
+          (cd new && uvicorn main:app --port 8002 > ../new.log 2>&1 &)
+          for p in 8001 8002; do
+            for i in $(seq 1 30); do curl -sf localhost:$p/health && break; sleep 1; done
+          done
+      - name: Smoke test (old vs new, GitHub runner)
+        if: ${{ !inputs.ig_probe }}
+        env:
+          OLD_SRC: old/main.py
+          NEW_SRC: new/main.py
+        run: python new/tests/smoke_live.py old=http://127.0.0.1:8001 new=http://127.0.0.1:8002
+      - name: Smoke test (live Render server, TikTok only)
+        if: ${{ inputs.production }}
+        env:
+          SITES: tiktok
+        run: python new/tests/smoke_live.py prod=https://clipzio-backend.onrender.com
+      - name: Server logs
+        if: always()
+        run: |
+          echo "--- old"; cat old.log || true
+          echo "--- new"; cat new.log || true
