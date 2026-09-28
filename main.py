@@ -19,14 +19,17 @@ Instagram (and sometimes TikTok) rate-limit datacenter IPs. Three things fight
 that here:
   * cookies (set IG_COOKIES_B64 to a base64 cookies.txt from a burner
     account) - free and unlimited, tried first for Instagram,
-  * RapidAPI (RAPIDAPI_KEY) as a backup when cookies fail, and
+  * free public Instagram mirrors (no key) next,
+  * RapidAPI (RAPIDAPI_KEY) only as a last resort, and
   * retry with backoff on transient failures.
 
 TikTok blocks yt-dlp from datacenter IPs, so TikTok links resolve via tikwm
 (free, no key) first, with yt-dlp as the backup.
 """
 import base64
+import html
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -145,13 +148,17 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = os.environ.get(
     "RAPIDAPI_HOST", "instagram-reels-downloader-api.p.rapidapi.com"
 )
-# Instagram order (IG_STRATEGY):
-#   auto            cookies (yt-dlp) first when IG cookies are set - free and
-#                   unlimited - and RapidAPI only as a backup; RapidAPI first
-#                   when there are no cookies. (default)
-#   ytdlp_first     always yt-dlp first, RapidAPI as backup
-#   rapidapi_first  always RapidAPI first, yt-dlp as backup
-IG_STRATEGY = os.environ.get("IG_STRATEGY", "auto").strip().lower()
+# Instagram: the methods tried, in order, until one works (IG_ORDER).
+#   cookies   yt-dlp with IG_COOKIES_B64 (free; skipped when no cookies)
+#   mirrors   free public Instagram mirrors (IG_MIRRORS), no key
+#   rapidapi  RapidAPI (RAPIDAPI_KEY; skipped when unset or quota used up)
+#   ytdlp     yt-dlp without cookies (Instagram usually blocks server IPs)
+# Free methods come first so the RapidAPI free quota is only a last resort.
+IG_ORDER = tuple(
+    m.strip().lower()
+    for m in os.environ.get("IG_ORDER", "cookies,mirrors,rapidapi,ytdlp").split(",")
+    if m.strip()
+)
 # When RapidAPI says the quota is used up (429) or the key is rejected
 # (401/403), stop calling it for a while and go straight to yt-dlp.
 RAPIDAPI_COOLDOWN_S = int(os.environ.get("RAPIDAPI_COOLDOWN_S", "3600"))
@@ -252,6 +259,88 @@ def _resolve_via_tikwm(url: str) -> dict:
         "duration": int(d.get("duration") or 0),
         "noWatermark": True,
     }
+
+
+# --- free Instagram mirrors (no key, no cookies) -----------------------------
+# Public "embed fixer" sites that serve an Instagram post's video to link
+# previews. Free, but best-effort: they don't have every post, and some return
+# only a thumbnail, so every result is checked to really be a video.
+IG_MIRRORS = tuple(
+    h.strip()
+    for h in os.environ.get(
+        "IG_MIRRORS", "kkinstagram.com,uuinstagram.com,eeinstagram.com"
+    ).split(",")
+    if h.strip()
+)
+_PREVIEW_BOT_UA = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
+
+
+def _ig_shortcode(url: str) -> str | None:
+    m = re.search(r"/(?:p|reels?|tv)/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else None
+
+
+def _meta(page: str, prop: str) -> str | None:
+    m = re.search(
+        rf'<meta[^>]+(?:property|name)="{re.escape(prop)}"[^>]+content="([^"]*)"',
+        page,
+    ) or re.search(
+        rf'<meta[^>]+content="([^"]*)"[^>]+(?:property|name)="{re.escape(prop)}"',
+        page,
+    )
+    return html.unescape(m.group(1)) if m else None
+
+
+def _video_url_ok(c: httpx.Client, url: str) -> str | None:
+    """Return the final URL if it serves a video, else None."""
+    with c.stream(
+        "GET", url, headers={"User-Agent": BROWSER_UA, "Range": "bytes=0-0"}
+    ) as r:
+        ctype = r.headers.get("content-type", "")
+        if r.status_code in (200, 206) and ctype.startswith("video/"):
+            return str(r.url)
+    return None
+
+
+def _resolve_via_ig_mirrors(url: str) -> dict:
+    sc = _ig_shortcode(url)
+    if not sc:
+        raise HTTPException(status_code=422, detail="mirrors: no shortcode")
+    with httpx.Client(timeout=20, follow_redirects=True) as c:
+        for host in IG_MIRRORS:
+            try:
+                r = c.get(
+                    f"https://{host}/reel/{sc}/",
+                    headers={"User-Agent": _PREVIEW_BOT_UA},
+                )
+                page = ""
+                if r.headers.get("content-type", "").startswith("video/"):
+                    video = str(r.url)
+                else:
+                    page = r.text
+                    video = _meta(page, "og:video") or _meta(
+                        page, "og:video:secure_url"
+                    ) or _meta(page, "og:video:url")
+                if not video:
+                    continue
+                if video.startswith("/"):
+                    video = f"https://{host}{video}"
+                final = _video_url_ok(c, video)
+                if not final:
+                    continue
+                title = _meta(page, "og:description") or _meta(page, "og:title")
+                who = re.search(r"@([A-Za-z0-9._]+)", _meta(page, "og:title") or "")
+                return {
+                    "downloadUrl": final,
+                    "thumbnail": _meta(page, "og:image"),
+                    "author": f"@{who.group(1)}" if who else None,
+                    "title": title,
+                    "duration": 0,
+                    "noWatermark": True,
+                }
+            except httpx.HTTPError as e:
+                print(f"mirror {host} failed: {e}")
+    raise HTTPException(status_code=422, detail="mirrors: no video found")
 
 
 # --- short cache of /resolve answers -----------------------------------------
@@ -475,7 +564,8 @@ def health():
         "cookies": bool(_COOKIEFILE),
         "rapidapi": bool(RAPIDAPI_KEY),
         "rapidapi_paused": time.monotonic() < _rapidapi_off_until,
-        "ig_strategy": IG_STRATEGY,
+        "ig_order": list(IG_ORDER),
+        "ig_mirrors": list(IG_MIRRORS),
         "tikwm": TIKWM_ENABLED,
     }
 
@@ -498,42 +588,45 @@ def resolve(request: Request, url: str = Query(..., description="Video URL")):
             detail = e.detail if isinstance(e, HTTPException) else e
             print(f"tikwm failed, falling back to yt-dlp: {detail}")
 
-    is_ig = _host_matches(host, INSTAGRAM_HOSTS)
-    rapid_ok = bool(
-        RAPIDAPI_KEY and is_ig and time.monotonic() >= _rapidapi_off_until
-    )
-    ytdlp_first = IG_STRATEGY == "ytdlp_first" or (
-        IG_STRATEGY == "auto" and bool(_COOKIEFILE)
-    )
-
-    if rapid_ok and not ytdlp_first:
-        # RapidAPI first, yt-dlp as backup.
-        try:
-            result = _resolve_via_rapidapi(url)
-            _cache_put(url, result)
-            return result
-        except Exception as e:  # noqa: BLE001
-            detail = e.detail if isinstance(e, HTTPException) else e
-            print(f"rapidapi failed, falling back to yt-dlp: {detail}")
-    elif rapid_ok:
-        # yt-dlp (free, unlimited) first; RapidAPI only if it fails, e.g.
-        # expired cookies. One attempt so the backup kicks in quickly.
-        try:
-            result = _resolve_via_ytdlp(url, attempts=1)
-        except HTTPException as first:
-            print("yt-dlp failed for instagram, trying rapidapi")
-            try:
-                result = _resolve_via_rapidapi(url)
-            except Exception as e:  # noqa: BLE001
-                detail = e.detail if isinstance(e, HTTPException) else e
-                print(f"rapidapi backup failed too: {detail}")
-                raise first
-        _cache_put(url, result)
-        return result
-
-    result = _resolve_via_ytdlp(url)
+    if _host_matches(host, INSTAGRAM_HOSTS):
+        result = _resolve_instagram(url)
+    else:
+        result = _resolve_via_ytdlp(url)
     _cache_put(url, result)
     return result
+
+
+def _resolve_instagram(url: str) -> dict:
+    """Try each method in IG_ORDER until one returns a video."""
+    tried_ytdlp = False
+    for method in IG_ORDER:
+        try:
+            if method == "cookies":
+                if not _COOKIEFILE:
+                    continue
+                tried_ytdlp = True
+                return _resolve_via_ytdlp(url, attempts=1)
+            if method == "mirrors":
+                if IG_MIRRORS:
+                    return _resolve_via_ig_mirrors(url)
+                continue
+            if method == "rapidapi":
+                if RAPIDAPI_KEY and time.monotonic() >= _rapidapi_off_until:
+                    return _resolve_via_rapidapi(url)
+                continue
+            if method == "ytdlp":
+                if tried_ytdlp:
+                    continue  # already tried (with cookies)
+                tried_ytdlp = True
+                return _resolve_via_ytdlp(url, attempts=1)
+        except Exception as e:  # noqa: BLE001
+            detail = e.detail if isinstance(e, HTTPException) else e
+            print(f"instagram: {method} failed: {detail}")
+    raise HTTPException(
+        status_code=422,
+        detail="Could not get this video. It may be private, removed, "
+        "or temporarily unavailable.",
+    )
 
 
 def _resolve_via_ytdlp(url: str, attempts: int = 3) -> dict:
@@ -567,6 +660,9 @@ async def download(request: Request, url: str = Query(...)):
         except Exception as e:  # noqa: BLE001
             detail = e.detail if isinstance(e, HTTPException) else e
             print(f"download: tikwm failed, falling back to yt-dlp: {detail}")
+    elif _host_matches(host, INSTAGRAM_HOSTS):
+        # Same free-first chain as /resolve.
+        target = (await run_in_threadpool(_resolve_instagram, url))["downloadUrl"]
 
     if target is None:
         # yt-dlp is blocking; run it off the event loop so other requests

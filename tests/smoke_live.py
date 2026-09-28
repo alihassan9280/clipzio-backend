@@ -36,6 +36,7 @@ INSTAGRAM = [
     "https://www.instagram.com/reel/Chunk8-jurw/",
     "https://www.instagram.com/reel/CDUMkliABpa/",
     "https://www.instagram.com/p/BQ0eAlwhDrw/",
+    "https://www.instagram.com/reels/Cop84x6u7CP/",
 ]
 # What a Flutter app's plain HTTP client sends.
 APP_UA = "Dart/3.5 (dart:io)"

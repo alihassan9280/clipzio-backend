@@ -25,12 +25,17 @@ for **both** platforms (more reliable than the built-in client-side resolvers).
 Only Instagram and TikTok links are accepted (`400 Unsupported link` otherwise).
 There is no download limit by default (see `RATE_LIMIT_PER_MIN`).
 
-### Instagram: unlimited by default
-With `IG_STRATEGY=auto` (the default) and `IG_COOKIES_B64` set, Instagram goes
-through yt-dlp + cookies first (free, no quota). RapidAPI is only used as a
-backup when that fails (e.g. the cookies expired), so its small free quota
-lasts. Without cookies, RapidAPI is tried first. `/health` shows `cookies`,
-`rapidapi_paused` and `ig_strategy`.
+### Instagram: free methods first
+Instagram is tried in this order (`IG_ORDER`) until one works:
+
+1. **cookies**: yt-dlp with `IG_COOKIES_B64` (free, unlimited; skipped if not set)
+2. **mirrors**: free public Instagram mirrors, no key (`IG_MIRRORS`); best-effort
+3. **rapidapi**: only if `RAPIDAPI_KEY` is set (free plan = small monthly quota)
+4. **ytdlp**: without cookies (Instagram usually blocks server IPs)
+
+Instagram blocks logged-out requests from server IPs, so no free server-side
+method is 100% reliable. The fully free and permanent option is resolving
+Instagram on the phone (the user's own IP), like the app does for TikTok.
 
 ## Environment variables (Render → service → Environment)
 
@@ -41,7 +46,8 @@ lasts. Without cookies, RapidAPI is tried first. `/health` shows `cookies`,
 | `RAPIDAPI_COOLDOWN_S` | `3600` | After RapidAPI returns 401/403/429 (quota used up), skip it for this long |
 | `RESOLVE_CACHE_TTL` | `900` | Seconds a `/resolve` answer is reused for the same link (saves quota); `0` = off |
 | `IG_COOKIES_B64` | — | Base64 Instagram `cookies.txt` for yt-dlp (free, unlimited IG) |
-| `IG_STRATEGY` | `auto` | `auto` (cookies first if set), `ytdlp_first` or `rapidapi_first` |
+| `IG_ORDER` | `cookies,mirrors,rapidapi,ytdlp` | Instagram methods, in order. Remove `rapidapi` to never use it |
+| `IG_MIRRORS` | `kkinstagram.com,uuinstagram.com,eeinstagram.com` | Free Instagram mirror sites |
 | `TIKWM` | `1` | TikTok via tikwm first (TikTok blocks yt-dlp on server IPs); `0` = yt-dlp only |
 | `ALLOWED_HOSTS` | `instagram.com,instagr.am,tiktok.com,tiktokv.com` | Sites the server will resolve |
 | `RATE_LIMIT_PER_MIN` | `0` (off) | Requests per minute per IP, if you ever need to stop abuse |
